@@ -164,6 +164,16 @@ in {
       };
     };
 
+    stateFile = lib.mkOption {
+      type = lib.types.str;
+      default = "/usr/local/var/opnix/state.json";
+      description = ''
+        Path to the unified state file for caching and change detection.
+        This file stores secret hashes and fetch timestamps to reduce
+        1Password API calls and track changes for service restarts.
+      '';
+    };
+
     caching = lib.mkOption {
       type = lib.types.submodule {
         options = {
@@ -191,12 +201,6 @@ in {
               After this time, the secret will be re-fetched from 1Password.
             '';
             example = "12h";
-          };
-
-          cacheFile = lib.mkOption {
-            type = lib.types.str;
-            default = "/usr/local/var/opnix/cache.json";
-            description = "Path to the cache metadata file";
           };
         };
       };
@@ -266,10 +270,10 @@ in {
                 variables = secret.variables;
               })
               (validateSecretKeys cfg.secrets);
+            stateFile = cfg.stateFile;
             caching = {
               enable = cfg.caching.enable;
               ttl = cfg.caching.ttl;
-              cacheFile = cfg.caching.cacheFile;
             };
           })
         else null;
@@ -331,10 +335,10 @@ in {
               chmod 750 ${cfg.outputDir}
 
               ${lib.optionalString cfg.caching.enable ''
-              # Create cache directory if caching is enabled
-              mkdir -p $(dirname ${cfg.caching.cacheFile})
-              chmod 755 $(dirname ${cfg.caching.cacheFile})
-              echo "INFO: Caching enabled (TTL: ${cfg.caching.ttl})"
+              # Create state directory if caching is enabled
+              mkdir -p $(dirname ${cfg.stateFile})
+              chmod 755 $(dirname ${cfg.stateFile})
+              echo "INFO: Caching enabled (TTL: ${cfg.caching.ttl}, state file: ${cfg.stateFile})"
               ''}
 
               # Set up token file with correct group permissions if it exists

@@ -1,11 +1,7 @@
 package systemd
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +10,7 @@ import (
 
 	"github.com/brizzbuzz/opnix/internal/config"
 	"github.com/brizzbuzz/opnix/internal/errors"
+	"github.com/brizzbuzz/opnix/internal/store"
 )
 
 // ServiceAction defines how to handle a service when secrets change
@@ -24,29 +21,17 @@ type ServiceAction struct {
 	After   []string
 }
 
-// SecretHash represents a stored hash of a secret's content
-type SecretHash struct {
-	Path         string    `json:"path"`
-	Hash         string    `json:"hash"`
-	LastModified time.Time `json:"lastModified"`
-}
-
-// HashStore manages secret content hashes for change detection
-type HashStore struct {
-	Hashes   map[string]SecretHash `json:"hashes"`
-	filePath string
-}
-
 // Manager handles systemd service integration and change detection
 type Manager struct {
 	config    config.SystemdIntegration
-	hashStore *HashStore
+	store     *store.SecretStore
 	dryRun    bool
 	systemctl string
 }
 
-// NewManager creates a new systemd integration manager
-func NewManager(cfg config.SystemdIntegration) (*Manager, error) {
+// NewManager creates a new systemd integration manager.
+// The store parameter is used for change detection when enabled.
+func NewManager(cfg config.SystemdIntegration, s *store.SecretStore) (*Manager, error) {
 	// Find systemctl binary
 	systemctl, err := exec.LookPath("systemctl")
 	if err != nil {
@@ -58,165 +43,11 @@ func NewManager(cfg config.SystemdIntegration) (*Manager, error) {
 		)
 	}
 
-	// Initialize hash store if change detection is enabled
-	var hashStore *HashStore
-	if cfg.ChangeDetection.Enable {
-		hashStore, err = NewHashStore(cfg.ChangeDetection.HashFile)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	return &Manager{
 		config:    cfg,
-		hashStore: hashStore,
+		store:     s,
 		systemctl: systemctl,
 	}, nil
-}
-
-// NewHashStore creates or loads a hash store from disk
-func NewHashStore(filePath string) (*HashStore, error) {
-	store := &HashStore{
-		Hashes:   make(map[string]SecretHash),
-		filePath: filePath,
-	}
-
-	// Create parent directory if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-		return nil, errors.FileOperationError(
-			"Creating hash store directory",
-			filepath.Dir(filePath),
-			"Failed to create directory for hash store",
-			err,
-		)
-	}
-
-	// Load existing hashes if file exists
-	if _, err := os.Stat(filePath); err == nil {
-		if err := store.load(); err != nil {
-			return nil, err
-		}
-	}
-
-	return store, nil
-}
-
-// load reads the hash store from disk
-func (hs *HashStore) load() error {
-	data, err := os.ReadFile(hs.filePath)
-	if err != nil {
-		return errors.FileOperationError(
-			"Loading hash store",
-			hs.filePath,
-			"Failed to read hash store file",
-			err,
-		)
-	}
-
-	if err := json.Unmarshal(data, hs); err != nil {
-		return errors.ConfigError(
-			"Parsing hash store",
-			"Invalid JSON format in hash store file",
-			err,
-		)
-	}
-
-	return nil
-}
-
-// save writes the hash store to disk
-func (hs *HashStore) save() error {
-	data, err := json.MarshalIndent(hs, "", "  ")
-	if err != nil {
-		return errors.ConfigError(
-			"Serializing hash store",
-			"Failed to marshal hash store data",
-			err,
-		)
-	}
-
-	if err := os.WriteFile(hs.filePath, data, 0644); err != nil {
-		return errors.FileOperationError(
-			"Saving hash store",
-			hs.filePath,
-			"Failed to write hash store file",
-			err,
-		)
-	}
-
-	return nil
-}
-
-// calculateHash calculates SHA-256 hash of a file's content
-func (hs *HashStore) calculateHash(filePath string) (string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", errors.FileOperationError(
-			"Opening file for hashing",
-			filePath,
-			"Failed to open file for hash calculation",
-			err,
-		)
-	}
-	defer func() { _ = file.Close() }() // Ignore error - defer cleanup is best effort
-
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return "", errors.FileOperationError(
-			"Reading file for hashing",
-			filePath,
-			"Failed to read file content for hash calculation",
-			err,
-		)
-	}
-
-	return hex.EncodeToString(hasher.Sum(nil)), nil
-}
-
-// HasChanged checks if a secret has changed since last deployment
-func (hs *HashStore) hasChanged(filePath string) (bool, error) {
-	// Calculate current hash
-	currentHash, err := hs.calculateHash(filePath)
-	if err != nil {
-		return false, err
-	}
-
-	// Get file info for modification time
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		return false, errors.FileOperationError(
-			"Getting file info",
-			filePath,
-			"Failed to get file information",
-			err,
-		)
-	}
-
-	// Check if we have a previous hash
-	previousHash, exists := hs.Hashes[filePath]
-	if !exists {
-		// First time seeing this file - it's "changed"
-		hs.Hashes[filePath] = SecretHash{
-			Path:         filePath,
-			Hash:         currentHash,
-			LastModified: fileInfo.ModTime(),
-		}
-		return true, nil
-	}
-
-	// Compare hashes
-	if previousHash.Hash != currentHash {
-		// Content changed - update stored hash
-		hs.Hashes[filePath] = SecretHash{
-			Path:         filePath,
-			Hash:         currentHash,
-			LastModified: fileInfo.ModTime(),
-		}
-		return true, nil
-	}
-
-	// No change detected
-	return false, nil
 }
 
 // ExtractServiceActions extracts service actions from secret configuration
@@ -313,9 +144,9 @@ func (m *Manager) ProcessSecretChanges(secrets []config.Secret, secretPaths map[
 
 		// Check if change detection is enabled
 		hasChanged := true // Default to always changed if detection disabled
-		if m.config.ChangeDetection.Enable && m.hashStore != nil {
+		if m.config.ChangeDetection.Enable && m.store != nil {
 			var err error
-			hasChanged, err = m.hashStore.hasChanged(secretPath)
+			hasChanged, err = m.store.HasChanged(secretPath)
 			if err != nil {
 				if m.config.ErrorHandling.ContinueOnError {
 					fmt.Fprintf(os.Stderr, "WARNING: Failed to check changes for %s: %v\n", secretName, err)
@@ -342,10 +173,10 @@ func (m *Manager) ProcessSecretChanges(secrets []config.Secret, secretPaths map[
 		}
 	}
 
-	// Save hash store if we have changes and change detection is enabled
-	if len(changedSecrets) > 0 && m.config.ChangeDetection.Enable && m.hashStore != nil {
-		if err := m.hashStore.save(); err != nil {
-			fmt.Fprintf(os.Stderr, "WARNING: Failed to save hash store: %v\n", err)
+	// Save store if we have changes and change detection is enabled
+	if len(changedSecrets) > 0 && m.config.ChangeDetection.Enable && m.store != nil {
+		if err := m.store.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: Failed to save state: %v\n", err)
 		}
 	}
 

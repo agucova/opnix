@@ -20,8 +20,10 @@ type Secret struct {
 }
 
 type ChangeDetection struct {
-	Enable   bool   `json:"enable"`
-	HashFile string `json:"hashFile"`
+	Enable bool `json:"enable"`
+	// HashFile is deprecated - use Config.StateFile instead
+	// Kept for backwards compatibility during migration
+	HashFile string `json:"hashFile,omitempty"`
 }
 
 type ErrorHandling struct {
@@ -49,16 +51,16 @@ type Caching struct {
 	// Default: "24h"
 	TTL string `json:"ttl,omitempty"`
 
-	// CacheFile is where cache metadata is stored
-	// Default: "/var/lib/opnix/cache.json"
+	// CacheFile is deprecated - use Config.StateFile instead
+	// Kept for backwards compatibility during migration
 	CacheFile string `json:"cacheFile,omitempty"`
 }
 
 // DefaultCacheTTL is the default time-to-live for cached secrets
 const DefaultCacheTTL = "24h"
 
-// DefaultCacheFile is the default location for the cache file
-const DefaultCacheFile = "/var/lib/opnix/cache.json"
+// DefaultStateFile is the default location for the unified state file
+const DefaultStateFile = "/var/lib/opnix/state.json"
 
 // GetTTL returns the configured TTL or the default if not set
 func (c *Caching) GetTTL() string {
@@ -68,20 +70,33 @@ func (c *Caching) GetTTL() string {
 	return c.TTL
 }
 
-// GetCacheFile returns the configured cache file path or the default if not set
-func (c *Caching) GetCacheFile() string {
-	if c.CacheFile == "" {
-		return DefaultCacheFile
-	}
-	return c.CacheFile
-}
-
 type Config struct {
 	Secrets            []Secret           `json:"secrets"`
 	PathTemplate       string             `json:"pathTemplate,omitempty"`
 	Defaults           map[string]string  `json:"defaults,omitempty"`
 	SystemdIntegration SystemdIntegration `json:"systemdIntegration,omitempty"`
 	Caching            Caching            `json:"caching,omitempty"`
+
+	// StateFile is the path to the unified state file for caching and change detection
+	// Default: "/var/lib/opnix/state.json"
+	StateFile string `json:"stateFile,omitempty"`
+}
+
+// GetStateFile returns the configured state file path or the default if not set.
+// It also handles backwards compatibility with deprecated CacheFile and HashFile options.
+func (c *Config) GetStateFile() string {
+	if c.StateFile != "" {
+		return c.StateFile
+	}
+	// Backwards compatibility: use CacheFile if set
+	if c.Caching.CacheFile != "" {
+		return c.Caching.CacheFile
+	}
+	// Backwards compatibility: use HashFile if set
+	if c.SystemdIntegration.ChangeDetection.HashFile != "" {
+		return c.SystemdIntegration.ChangeDetection.HashFile
+	}
+	return DefaultStateFile
 }
 
 // convertToValidationSecrets converts config secrets to validation format

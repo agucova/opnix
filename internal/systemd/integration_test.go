@@ -1,13 +1,12 @@
 package systemd
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/brizzbuzz/opnix/internal/config"
+	"github.com/brizzbuzz/opnix/internal/store"
 )
 
 // mockSystemdIntegration creates a test systemd integration config
@@ -17,8 +16,7 @@ func mockSystemdIntegration() config.SystemdIntegration {
 		Services:        []string{"caddy", "postgresql"},
 		RestartOnChange: true,
 		ChangeDetection: config.ChangeDetection{
-			Enable:   true,
-			HashFile: "/tmp/test-hashes.json",
+			Enable: true,
 		},
 		ErrorHandling: config.ErrorHandling{
 			RollbackOnFailure: false,
@@ -31,7 +29,8 @@ func mockSystemdIntegration() config.SystemdIntegration {
 func TestNewManager(t *testing.T) {
 	// Test with systemctl available (most systems)
 	cfg := mockSystemdIntegration()
-	manager, err := NewManager(cfg)
+	s := store.New("/tmp/test-state.json")
+	manager, err := NewManager(cfg, s)
 
 	if err != nil {
 		// If systemctl is not available, skip this test
@@ -52,58 +51,9 @@ func TestNewManager(t *testing.T) {
 	}
 }
 
-func TestHashStore(t *testing.T) {
+func TestStoreChangeDetection(t *testing.T) {
 	tempDir := t.TempDir()
-	hashFile := filepath.Join(tempDir, "test-hashes.json")
-
-	// Test creating new hash store
-	store, err := NewHashStore(hashFile)
-	if err != nil {
-		t.Fatalf("Failed to create hash store: %v", err)
-	}
-
-	if store == nil {
-		t.Fatal("Expected hash store to be created, got nil")
-	}
-
-	if len(store.Hashes) != 0 {
-		t.Errorf("Expected empty hash store, got %d entries", len(store.Hashes))
-	}
-
-	// Test saving and loading
-	testPath := "/test/path"
-	testHash := SecretHash{
-		Path:         testPath,
-		Hash:         "abc123",
-		LastModified: time.Now(),
-	}
-
-	store.Hashes[testPath] = testHash
-
-	if err := store.save(); err != nil {
-		t.Fatalf("Failed to save hash store: %v", err)
-	}
-
-	// Load from disk
-	store2, err := NewHashStore(hashFile)
-	if err != nil {
-		t.Fatalf("Failed to load hash store: %v", err)
-	}
-
-	if len(store2.Hashes) != 1 {
-		t.Errorf("Expected 1 hash entry, got %d", len(store2.Hashes))
-	}
-
-	if stored, exists := store2.Hashes[testPath]; !exists {
-		t.Error("Expected stored hash to exist")
-	} else if stored.Hash != testHash.Hash {
-		t.Errorf("Expected hash %s, got %s", testHash.Hash, stored.Hash)
-	}
-}
-
-func TestHashStoreChangeDetection(t *testing.T) {
-	tempDir := t.TempDir()
-	hashFile := filepath.Join(tempDir, "test-hashes.json")
+	stateFile := filepath.Join(tempDir, "test-state.json")
 	testFile := filepath.Join(tempDir, "test-secret.txt")
 
 	// Create test file
@@ -112,13 +62,13 @@ func TestHashStoreChangeDetection(t *testing.T) {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
 
-	store, err := NewHashStore(hashFile)
+	s, err := store.Load(stateFile)
 	if err != nil {
-		t.Fatalf("Failed to create hash store: %v", err)
+		t.Fatalf("Failed to create store: %v", err)
 	}
 
 	// First check - should detect change (new file)
-	changed, err := store.hasChanged(testFile)
+	changed, err := s.HasChanged(testFile)
 	if err != nil {
 		t.Fatalf("Failed to check for changes: %v", err)
 	}
@@ -128,7 +78,7 @@ func TestHashStoreChangeDetection(t *testing.T) {
 	}
 
 	// Second check with same content - should not detect change
-	changed, err = store.hasChanged(testFile)
+	changed, err = s.HasChanged(testFile)
 	if err != nil {
 		t.Fatalf("Failed to check for changes: %v", err)
 	}
@@ -144,7 +94,7 @@ func TestHashStoreChangeDetection(t *testing.T) {
 	}
 
 	// Should detect change
-	changed, err = store.hasChanged(testFile)
+	changed, err = s.HasChanged(testFile)
 	if err != nil {
 		t.Fatalf("Failed to check for changes: %v", err)
 	}
@@ -322,7 +272,8 @@ func TestServiceActionConfiguration(t *testing.T) {
 
 func TestManagerDryRun(t *testing.T) {
 	cfg := mockSystemdIntegration()
-	manager, err := NewManager(cfg)
+	s := store.New("/tmp/test-state.json")
+	manager, err := NewManager(cfg, s)
 	if err != nil {
 		t.Skipf("systemctl not available, skipping test: %v", err)
 		return
@@ -345,14 +296,13 @@ func TestManagerDryRun(t *testing.T) {
 
 func TestProcessSecretChanges(t *testing.T) {
 	tempDir := t.TempDir()
-	hashFile := filepath.Join(tempDir, "test-hashes.json")
+	stateFile := filepath.Join(tempDir, "test-state.json")
 
 	cfg := config.SystemdIntegration{
 		Enable:          true,
 		RestartOnChange: true,
 		ChangeDetection: config.ChangeDetection{
-			Enable:   true,
-			HashFile: hashFile,
+			Enable: true,
 		},
 		ErrorHandling: config.ErrorHandling{
 			ContinueOnError: true,
@@ -360,7 +310,12 @@ func TestProcessSecretChanges(t *testing.T) {
 		},
 	}
 
-	manager, err := NewManager(cfg)
+	s, err := store.Load(stateFile)
+	if err != nil {
+		t.Fatalf("Failed to create store: %v", err)
+	}
+
+	manager, err := NewManager(cfg, s)
 	if err != nil {
 		t.Skipf("systemctl not available, skipping test: %v", err)
 		return
@@ -393,63 +348,47 @@ func TestProcessSecretChanges(t *testing.T) {
 		t.Errorf("ProcessSecretChanges failed: %v", err)
 	}
 
-	// Check that hash store was created and saved
-	if _, err := os.Stat(hashFile); os.IsNotExist(err) {
-		t.Error("Expected hash file to be created")
+	// Save the store and check that state file was created
+	if err := s.Save(); err != nil {
+		t.Fatalf("Failed to save store: %v", err)
+	}
+
+	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+		t.Error("Expected state file to be created")
 	}
 }
 
-func TestHashStoreFileOperations(t *testing.T) {
+func TestStoreFileOperations(t *testing.T) {
 	tempDir := t.TempDir()
-	hashFile := filepath.Join(tempDir, "nested", "dir", "hashes.json")
+	stateFile := filepath.Join(tempDir, "nested", "dir", "state.json")
 
-	// Should create nested directories
-	store, err := NewHashStore(hashFile)
-	if err != nil {
-		t.Fatalf("Failed to create hash store with nested path: %v", err)
-	}
+	// Should create nested directories when saving
+	s := store.New(stateFile)
+	s.RecordFetch("/test", "op://vault/item", "value")
 
-	// Add a hash and save
-	store.Hashes["test"] = SecretHash{
-		Path:         "test",
-		Hash:         "testhash",
-		LastModified: time.Now(),
-	}
-
-	if err := store.save(); err != nil {
-		t.Fatalf("Failed to save hash store: %v", err)
+	if err := s.Save(); err != nil {
+		t.Fatalf("Failed to save store with nested path: %v", err)
 	}
 
 	// Verify file was created
-	if _, err := os.Stat(hashFile); os.IsNotExist(err) {
-		t.Error("Hash file was not created")
+	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+		t.Error("State file was not created")
 	}
 
-	// Verify content is valid JSON
-	data, err := os.ReadFile(hashFile)
+	// Load and verify
+	loaded, err := store.Load(stateFile)
 	if err != nil {
-		t.Fatalf("Failed to read hash file: %v", err)
+		t.Fatalf("Failed to load store: %v", err)
 	}
 
-	var parsed HashStore
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		t.Fatalf("Hash file contains invalid JSON: %v", err)
-	}
-
-	if len(parsed.Hashes) != 1 {
-		t.Errorf("Expected 1 hash in file, got %d", len(parsed.Hashes))
+	if loaded.Size() != 1 {
+		t.Errorf("Expected 1 entry, got %d", loaded.Size())
 	}
 }
 
-func TestCalculateHash(t *testing.T) {
+func TestComputeFileHash(t *testing.T) {
 	tempDir := t.TempDir()
-	hashFile := filepath.Join(tempDir, "hashes.json")
 	testFile := filepath.Join(tempDir, "test-file.txt")
-
-	store, err := NewHashStore(hashFile)
-	if err != nil {
-		t.Fatalf("Failed to create hash store: %v", err)
-	}
 
 	// Create test file
 	content := "test content for hashing"
@@ -458,7 +397,7 @@ func TestCalculateHash(t *testing.T) {
 	}
 
 	// Calculate hash
-	hash1, err := store.calculateHash(testFile)
+	hash1, err := store.ComputeFileHash(testFile)
 	if err != nil {
 		t.Fatalf("Failed to calculate hash: %v", err)
 	}
@@ -468,7 +407,7 @@ func TestCalculateHash(t *testing.T) {
 	}
 
 	// Calculate hash again - should be the same
-	hash2, err := store.calculateHash(testFile)
+	hash2, err := store.ComputeFileHash(testFile)
 	if err != nil {
 		t.Fatalf("Failed to calculate hash second time: %v", err)
 	}
@@ -482,7 +421,7 @@ func TestCalculateHash(t *testing.T) {
 		t.Fatalf("Failed to modify test file: %v", err)
 	}
 
-	hash3, err := store.calculateHash(testFile)
+	hash3, err := store.ComputeFileHash(testFile)
 	if err != nil {
 		t.Fatalf("Failed to calculate hash after modification: %v", err)
 	}

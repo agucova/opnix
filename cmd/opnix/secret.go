@@ -7,11 +7,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/brizzbuzz/opnix/internal/cache"
 	"github.com/brizzbuzz/opnix/internal/config"
 	"github.com/brizzbuzz/opnix/internal/errors"
 	"github.com/brizzbuzz/opnix/internal/onepass"
 	"github.com/brizzbuzz/opnix/internal/secrets"
+	"github.com/brizzbuzz/opnix/internal/store"
 	"github.com/brizzbuzz/opnix/internal/systemd"
 	"github.com/brizzbuzz/opnix/internal/validation"
 )
@@ -26,6 +26,8 @@ type systemdManager interface {
 	ProcessSecretChanges([]config.Secret, map[string]string) error
 }
 
+type systemdManagerFactory func(config.SystemdIntegration, *store.SecretStore) (systemdManager, error)
+
 type secretCommand struct {
 	fs         *flag.FlagSet
 	configFile string
@@ -36,7 +38,7 @@ type secretCommand struct {
 	loadConfig       func(string) (*config.Config, error)
 	newClient        func(string) (secrets.SecretClient, error)
 	processorFactory func(secrets.SecretClient, string) secretProcessor
-	systemdFactory   func(config.SystemdIntegration) (systemdManager, error)
+	systemdFactory   systemdManagerFactory
 }
 
 func newSecretCommand() *secretCommand {
@@ -63,8 +65,8 @@ func newSecretCommand() *secretCommand {
 	sc.processorFactory = func(client secrets.SecretClient, outputDir string) secretProcessor {
 		return secrets.NewProcessor(client, outputDir)
 	}
-	sc.systemdFactory = func(cfg config.SystemdIntegration) (systemdManager, error) {
-		return systemd.NewManager(cfg)
+	sc.systemdFactory = func(cfg config.SystemdIntegration, s *store.SecretStore) (systemdManager, error) {
+		return systemd.NewManager(cfg, s)
 	}
 
 	return sc
@@ -103,8 +105,35 @@ func (s *secretCommand) Run() error {
 	// Create processor
 	processor := s.processorFactory(client, s.outputDir)
 
+	// Load unified state store for caching and change detection
+	var secretStore *store.SecretStore
+	stateFile := cfg.GetStateFile()
+
+	// Load the store if caching is enabled or systemd change detection is enabled
+	needsStore := (cfg.Caching.Enable && !s.force) || cfg.SystemdIntegration.ChangeDetection.Enable
+	if needsStore {
+		var err error
+		secretStore, err = store.Load(stateFile)
+		if err != nil {
+			// Non-fatal: log warning and continue without store
+			log.Printf("Warning: failed to load state, continuing without caching/change detection: %v", err)
+		} else {
+			log.Printf("State loaded from %s (%d entries)", stateFile, secretStore.Size())
+
+			// Handle migration from legacy files if needed
+			if cfg.Caching.CacheFile != "" || cfg.SystemdIntegration.ChangeDetection.HashFile != "" {
+				if err := secretStore.MigrateFromCustomPaths(
+					cfg.Caching.CacheFile,
+					cfg.SystemdIntegration.ChangeDetection.HashFile,
+				); err != nil {
+					log.Printf("Warning: migration from legacy files failed: %v", err)
+				}
+			}
+		}
+	}
+
 	// Set up caching if enabled and not forced
-	if cfg.Caching.Enable && !s.force {
+	if cfg.Caching.Enable && !s.force && secretStore != nil {
 		ttl, err := time.ParseDuration(cfg.Caching.GetTTL())
 		if err != nil {
 			return errors.ConfigError(
@@ -114,16 +143,10 @@ func (s *secretCommand) Run() error {
 			)
 		}
 
-		secretCache, err := cache.Load(cfg.Caching.GetCacheFile())
-		if err != nil {
-			// Non-fatal: log warning and continue without cache
-			log.Printf("Warning: failed to load cache, continuing without caching: %v", err)
-		} else {
-			// Type assert to get the concrete processor type to call SetCache
-			if p, ok := processor.(*secrets.Processor); ok {
-				p.SetCache(secretCache, ttl)
-				log.Printf("Caching enabled (TTL: %v, cache file: %s)", ttl, cfg.Caching.GetCacheFile())
-			}
+		// Type assert to get the concrete processor type to call SetStore
+		if p, ok := processor.(*secrets.Processor); ok {
+			p.SetStore(secretStore, ttl)
+			log.Printf("Caching enabled (TTL: %v, state file: %s)", ttl, stateFile)
 		}
 	} else if s.force {
 		log.Printf("Force mode enabled - bypassing cache")
@@ -147,7 +170,7 @@ func (s *secretCommand) Run() error {
 	if cfg.SystemdIntegration.Enable {
 		log.Printf("Processing systemd integration for %d services", len(cfg.SystemdIntegration.Services))
 
-		systemdManager, err := s.systemdFactory(cfg.SystemdIntegration)
+		systemdManager, err := s.systemdFactory(cfg.SystemdIntegration, secretStore)
 		if err != nil {
 			return errors.WrapWithSuggestions(
 				err,

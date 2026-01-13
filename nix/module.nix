@@ -246,13 +246,10 @@ in {
                 enable = lib.mkOption {
                   type = lib.types.bool;
                   default = true;
-                  description = "Enable content-based change detection to avoid unnecessary service restarts";
-                };
-
-                hashFile = lib.mkOption {
-                  type = lib.types.str;
-                  default = "/var/lib/opnix/secret-hashes.json";
-                  description = "File to store secret content hashes for change detection";
+                  description = ''
+                    Enable content-based change detection to avoid unnecessary service restarts.
+                    Uses the unified stateFile for storing secret hashes.
+                  '';
                 };
               };
             };
@@ -291,6 +288,16 @@ in {
       description = "Systemd service integration configuration";
     };
 
+    stateFile = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/opnix/state.json";
+      description = ''
+        Path to the unified state file for caching and change detection.
+        This file stores secret hashes and fetch timestamps to reduce
+        1Password API calls and track changes for service restarts.
+      '';
+    };
+
     caching = lib.mkOption {
       type = lib.types.submodule {
         options = {
@@ -318,12 +325,6 @@ in {
               After this time, the secret will be re-fetched from 1Password.
             '';
             example = "12h";
-          };
-
-          cacheFile = lib.mkOption {
-            type = lib.types.str;
-            default = "/var/lib/opnix/cache.json";
-            description = "Path to the cache metadata file";
           };
         };
       };
@@ -394,10 +395,10 @@ in {
             pathTemplate = cfg.pathTemplate;
             defaults = cfg.defaults;
             systemdIntegration = cfg.systemdIntegration;
+            stateFile = cfg.stateFile;
             caching = {
               enable = cfg.caching.enable;
               ttl = cfg.caching.ttl;
-              cacheFile = cfg.caching.cacheFile;
             };
           })
         else null;
@@ -459,19 +460,14 @@ in {
               mkdir -p ${cfg.outputDir}
               chmod 751 ${cfg.outputDir}
 
-              # Create systemd integration directories if needed
-              ${lib.optionalString cfg.systemdIntegration.enable (
-                lib.optionalString cfg.systemdIntegration.changeDetection.enable ''
-                  mkdir -p $(dirname ${cfg.systemdIntegration.changeDetection.hashFile})
-                  chmod 755 $(dirname ${cfg.systemdIntegration.changeDetection.hashFile})
-                ''
-              )}
+              # Create state directory if caching or change detection is enabled
+              ${lib.optionalString (cfg.caching.enable || cfg.systemdIntegration.changeDetection.enable) ''
+                mkdir -p $(dirname ${cfg.stateFile})
+                chmod 755 $(dirname ${cfg.stateFile})
+              ''}
 
-              # Create cache directory if caching is enabled
               ${lib.optionalString cfg.caching.enable ''
-                mkdir -p $(dirname ${cfg.caching.cacheFile})
-                chmod 755 $(dirname ${cfg.caching.cacheFile})
-                echo "INFO: Caching enabled (TTL: ${cfg.caching.ttl})"
+                echo "INFO: Caching enabled (TTL: ${cfg.caching.ttl}, state file: ${cfg.stateFile})"
               ''}
 
               # Set up token file with correct group permissions if it exists

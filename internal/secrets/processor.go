@@ -11,9 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/brizzbuzz/opnix/internal/cache"
 	"github.com/brizzbuzz/opnix/internal/config"
 	"github.com/brizzbuzz/opnix/internal/errors"
+	"github.com/brizzbuzz/opnix/internal/store"
 )
 
 type SecretClient interface {
@@ -32,8 +32,8 @@ type Processor struct {
 	pathTemplate string
 	defaults     map[string]string
 
-	// Caching support
-	cache    *cache.Cache
+	// State management (caching and change detection)
+	store    *store.SecretStore
 	cacheTTL time.Duration
 }
 
@@ -53,21 +53,26 @@ func NewProcessorWithConfig(client SecretClient, outputDir, pathTemplate string,
 	}
 }
 
-// NewProcessorWithCache creates a processor with caching enabled.
-// The cache reduces 1Password API calls by skipping secrets that are still valid.
-func NewProcessorWithCache(client SecretClient, outputDir string, c *cache.Cache, ttl time.Duration) *Processor {
+// NewProcessorWithStore creates a processor with state management enabled.
+// The store reduces 1Password API calls by skipping secrets that are still valid.
+func NewProcessorWithStore(client SecretClient, outputDir string, s *store.SecretStore, ttl time.Duration) *Processor {
 	return &Processor{
 		client:    client,
 		outputDir: outputDir,
-		cache:     c,
+		store:     s,
 		cacheTTL:  ttl,
 	}
 }
 
-// SetCache enables caching on an existing processor.
-func (p *Processor) SetCache(c *cache.Cache, ttl time.Duration) {
-	p.cache = c
+// SetStore enables state management on an existing processor.
+func (p *Processor) SetStore(s *store.SecretStore, ttl time.Duration) {
+	p.store = s
 	p.cacheTTL = ttl
+}
+
+// GetStore returns the processor's store, if any.
+func (p *Processor) GetStore() *store.SecretStore {
+	return p.store
 }
 
 func (p *Processor) Process(cfg *config.Config) (*ProcessResult, error) {
@@ -118,11 +123,11 @@ func (p *Processor) Process(cfg *config.Config) (*ProcessResult, error) {
 		}
 	}
 
-	// Save the cache if caching is enabled
-	if p.cache != nil {
-		if err := p.cache.Save(); err != nil {
-			// Log warning but don't fail - cache save is not critical
-			log.Printf("Warning: failed to save cache: %v", err)
+	// Save the store if enabled
+	if p.store != nil {
+		if err := p.store.Save(); err != nil {
+			// Log warning but don't fail - store save is not critical
+			log.Printf("Warning: failed to save state: %v", err)
 		}
 	}
 
@@ -138,8 +143,8 @@ func (p *Processor) processSecret(secret config.Secret, secretName string) (stri
 		return "", false, err
 	}
 
-	// Check cache before making API call
-	if p.cache != nil && !p.cache.NeedsRefresh(outputPath, secret.Reference, p.cacheTTL) {
+	// Check store before making API call
+	if p.store != nil && !p.store.NeedsFetch(outputPath, secret.Reference, p.cacheTTL) {
 		log.Printf("Skipping %s (cached, TTL: %v)", secretName, p.cacheTTL)
 		return outputPath, true, nil
 	}
@@ -207,9 +212,9 @@ func (p *Processor) processSecret(secret config.Secret, secretName string) (stri
 		return "", false, err
 	}
 
-	// Update cache after successful fetch
-	if p.cache != nil {
-		p.cache.Update(outputPath, secret.Reference, value)
+	// Update store after successful fetch
+	if p.store != nil {
+		p.store.RecordFetch(outputPath, secret.Reference, value)
 	}
 
 	return outputPath, false, nil
