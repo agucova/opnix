@@ -20,11 +20,8 @@ import (
 // DefaultStateFile is the default location for the unified state file
 const DefaultStateFile = "/var/lib/opnix/state.json"
 
-// Legacy file paths for auto-migration
-const (
-	legacyCacheFile     = "/var/lib/opnix/cache.json"
-	legacyHashStoreFile = "/var/lib/opnix/secret-hashes.json"
-)
+// Legacy file path for auto-migration from upstream opnix
+const legacyHashStoreFile = "/var/lib/opnix/secret-hashes.json"
 
 // SecretEntry represents a secret's state, combining caching and change detection data.
 type SecretEntry struct {
@@ -87,24 +84,10 @@ func Load(path string) (*SecretStore, error) {
 		return store, nil
 	}
 
-	// State file doesn't exist - try auto-migration from legacy files
-	migrated := false
-
-	// Migrate from legacy cache.json
-	if err := store.migrateFromLegacyCache(legacyCacheFile); err == nil {
-		migrated = true
-	}
-
-	// Migrate from legacy secret-hashes.json
-	if err := store.migrateFromLegacyHashStore(legacyHashStoreFile); err == nil {
-		migrated = true
-	}
-
-	// Save migrated data and clean up legacy files
-	if migrated && len(store.Entries) > 0 {
+	// State file doesn't exist - try auto-migration from upstream's HashStore
+	if err := store.migrateFromLegacyHashStore(legacyHashStoreFile); err == nil && len(store.Entries) > 0 {
 		if err := store.Save(); err == nil {
-			// Successfully saved - remove legacy files
-			_ = os.Remove(legacyCacheFile)
+			// Successfully saved - remove legacy file
 			_ = os.Remove(legacyHashStoreFile)
 		}
 	}
@@ -112,60 +95,19 @@ func Load(path string) (*SecretStore, error) {
 	return store, nil
 }
 
-// legacyCacheEntry represents the old cache.json format
-type legacyCacheEntry struct {
-	Reference   string    `json:"reference"`
-	ContentHash string    `json:"content_hash"`
-	LastFetched time.Time `json:"last_fetched"`
-}
-
-// legacyCache represents the old cache.json format
-type legacyCache struct {
-	Entries map[string]legacyCacheEntry `json:"entries"`
-}
-
-// migrateFromLegacyCache migrates data from the old cache.json format
-func (s *SecretStore) migrateFromLegacyCache(path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	var cache legacyCache
-	if err := json.Unmarshal(data, &cache); err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for path, entry := range cache.Entries {
-		// Only migrate if we don't already have this entry
-		if _, exists := s.Entries[path]; !exists {
-			s.Entries[path] = SecretEntry{
-				Reference:   entry.Reference,
-				ContentHash: entry.ContentHash,
-				LastFetched: entry.LastFetched,
-			}
-		}
-	}
-
-	return nil
-}
-
-// legacySecretHash represents the old secret-hashes.json entry format
+// legacySecretHash represents upstream's secret-hashes.json entry format
 type legacySecretHash struct {
 	Path         string    `json:"path"`
 	Hash         string    `json:"hash"`
 	LastModified time.Time `json:"lastModified"`
 }
 
-// legacyHashStore represents the old secret-hashes.json format
+// legacyHashStore represents upstream's secret-hashes.json format
 type legacyHashStore struct {
 	Hashes map[string]legacySecretHash `json:"hashes"`
 }
 
-// migrateFromLegacyHashStore migrates data from the old secret-hashes.json format
+// migrateFromLegacyHashStore migrates data from upstream's secret-hashes.json format
 func (s *SecretStore) migrateFromLegacyHashStore(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -415,30 +357,19 @@ func (s *SecretStore) Path() string {
 	return s.path
 }
 
-// MigrateFromCustomPaths attempts to migrate from custom legacy file locations.
-// This is useful when the user has configured non-default paths.
-func (s *SecretStore) MigrateFromCustomPaths(cachePath, hashStorePath string) error {
-	var migrated bool
-
-	if cachePath != "" {
-		if err := s.migrateFromLegacyCache(cachePath); err == nil {
-			migrated = true
-			_ = os.Remove(cachePath)
-		}
+// MigrateFromCustomHashStorePath attempts to migrate from a custom HashStore location.
+// This is useful when the user has configured a non-default hashFile path in upstream opnix.
+func (s *SecretStore) MigrateFromCustomHashStorePath(hashStorePath string) error {
+	if hashStorePath == "" {
+		return nil
 	}
 
-	if hashStorePath != "" {
-		if err := s.migrateFromLegacyHashStore(hashStorePath); err == nil {
-			migrated = true
-			_ = os.Remove(hashStorePath)
-		}
+	if err := s.migrateFromLegacyHashStore(hashStorePath); err != nil {
+		return err
 	}
 
-	if migrated {
-		return s.Save()
-	}
-
-	return nil
+	_ = os.Remove(hashStorePath)
+	return s.Save()
 }
 
 // String returns a debug string representation of the store.

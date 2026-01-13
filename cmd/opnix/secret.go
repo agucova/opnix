@@ -120,13 +120,12 @@ func (s *secretCommand) Run() error {
 		} else {
 			log.Printf("State loaded from %s (%d entries)", stateFile, secretStore.Size())
 
-			// Handle migration from legacy files if needed
-			if cfg.Caching.CacheFile != "" || cfg.SystemdIntegration.ChangeDetection.HashFile != "" {
-				if err := secretStore.MigrateFromCustomPaths(
-					cfg.Caching.CacheFile,
+			// Handle migration from upstream's custom hashFile path if configured
+			if cfg.SystemdIntegration.ChangeDetection.HashFile != "" {
+				if err := secretStore.MigrateFromCustomHashStorePath(
 					cfg.SystemdIntegration.ChangeDetection.HashFile,
 				); err != nil {
-					log.Printf("Warning: migration from legacy files failed: %v", err)
+					log.Printf("Warning: migration from legacy hashFile failed: %v", err)
 				}
 			}
 		}

@@ -362,44 +362,6 @@ func TestAtomicSave(t *testing.T) {
 	}
 }
 
-func TestMigrateFromLegacyCache(t *testing.T) {
-	tmpDir := t.TempDir()
-	cachePath := filepath.Join(tmpDir, "cache.json")
-	statePath := filepath.Join(tmpDir, "state.json")
-
-	// Create legacy cache file
-	legacyData := legacyCache{
-		Entries: map[string]legacyCacheEntry{
-			"/run/secrets/db-password": {
-				Reference:   "op://Vault/DB/password",
-				ContentHash: "abc123",
-				LastFetched: time.Now().Add(-time.Hour),
-			},
-		},
-	}
-	data, _ := json.Marshal(legacyData)
-	if err := os.WriteFile(cachePath, data, 0644); err != nil {
-		t.Fatalf("Failed to write legacy cache: %v", err)
-	}
-
-	s := New(statePath)
-	if err := s.migrateFromLegacyCache(cachePath); err != nil {
-		t.Fatalf("Migration failed: %v", err)
-	}
-
-	if len(s.Entries) != 1 {
-		t.Errorf("Expected 1 entry after migration, got %d", len(s.Entries))
-	}
-
-	entry, exists := s.Entries["/run/secrets/db-password"]
-	if !exists {
-		t.Fatal("Expected migrated entry")
-	}
-	if entry.Reference != "op://Vault/DB/password" {
-		t.Errorf("Expected reference op://Vault/DB/password, got %s", entry.Reference)
-	}
-}
-
 func TestMigrateFromLegacyHashStore(t *testing.T) {
 	tmpDir := t.TempDir()
 	hashStorePath := filepath.Join(tmpDir, "hashes.json")
@@ -438,78 +400,36 @@ func TestMigrateFromLegacyHashStore(t *testing.T) {
 	}
 }
 
-func TestMigrateFromBothLegacy(t *testing.T) {
+func TestMigrateFromCustomHashStorePath(t *testing.T) {
 	tmpDir := t.TempDir()
-	cachePath := filepath.Join(tmpDir, "cache.json")
-	hashStorePath := filepath.Join(tmpDir, "hashes.json")
+	hashStorePath := filepath.Join(tmpDir, "custom-hashes.json")
 	statePath := filepath.Join(tmpDir, "state.json")
 
-	// Create legacy cache with one entry
-	cacheData := legacyCache{
-		Entries: map[string]legacyCacheEntry{
-			"/run/secrets/shared": {
-				Reference:   "op://Vault/Shared/secret",
-				ContentHash: "hash1",
-				LastFetched: time.Now(),
-			},
-		},
-	}
-	data, _ := json.Marshal(cacheData)
-	if err := os.WriteFile(cachePath, data, 0644); err != nil {
-		t.Fatalf("Failed to write cache: %v", err)
-	}
-
-	// Create legacy hash store with different entry
+	// Create custom hash store (upstream's format)
 	hashData := legacyHashStore{
 		Hashes: map[string]legacySecretHash{
-			"/run/secrets/other": {
-				Path:         "/run/secrets/other",
-				Hash:         "hash2",
+			"/run/secrets/test": {
+				Path:         "/run/secrets/test",
+				Hash:         "testhash",
 				LastModified: time.Now(),
 			},
 		},
 	}
-	data, _ = json.Marshal(hashData)
-	if err := os.WriteFile(hashStorePath, data, 0644); err != nil {
-		t.Fatalf("Failed to write hash store: %v", err)
-	}
+	data, _ := json.Marshal(hashData)
+	os.WriteFile(hashStorePath, data, 0644)
 
 	s := New(statePath)
-	_ = s.migrateFromLegacyCache(cachePath)
-	_ = s.migrateFromLegacyHashStore(hashStorePath)
-
-	if len(s.Entries) != 2 {
-		t.Errorf("Expected 2 entries after migration, got %d", len(s.Entries))
-	}
-}
-
-func TestMigrateFromCustomPaths(t *testing.T) {
-	tmpDir := t.TempDir()
-	cachePath := filepath.Join(tmpDir, "custom-cache.json")
-	hashStorePath := filepath.Join(tmpDir, "custom-hashes.json")
-	statePath := filepath.Join(tmpDir, "state.json")
-
-	// Create custom cache
-	cacheData := legacyCache{
-		Entries: map[string]legacyCacheEntry{
-			"/path": {Reference: "ref", ContentHash: "hash", LastFetched: time.Now()},
-		},
-	}
-	data, _ := json.Marshal(cacheData)
-	os.WriteFile(cachePath, data, 0644)
-
-	s := New(statePath)
-	if err := s.MigrateFromCustomPaths(cachePath, hashStorePath); err != nil {
-		t.Fatalf("MigrateFromCustomPaths failed: %v", err)
+	if err := s.MigrateFromCustomHashStorePath(hashStorePath); err != nil {
+		t.Fatalf("MigrateFromCustomHashStorePath failed: %v", err)
 	}
 
 	if len(s.Entries) != 1 {
 		t.Errorf("Expected 1 entry after migration, got %d", len(s.Entries))
 	}
 
-	// Check that cache file was deleted
-	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
-		t.Error("Expected cache file to be deleted after migration")
+	// Check that hash store file was deleted
+	if _, err := os.Stat(hashStorePath); !os.IsNotExist(err) {
+		t.Error("Expected hash store file to be deleted after migration")
 	}
 }
 
