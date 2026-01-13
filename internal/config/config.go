@@ -38,11 +38,50 @@ type SystemdIntegration struct {
 	ErrorHandling   ErrorHandling   `json:"errorHandling"`
 }
 
+// Caching configures smart caching to reduce 1Password API calls.
+// When enabled, secrets are only fetched if they don't exist, have changed,
+// or have exceeded the TTL.
+type Caching struct {
+	// Enable turns on smart caching (default: false for backwards compatibility)
+	Enable bool `json:"enable"`
+
+	// TTL is how long a cached secret is considered fresh (e.g., "24h", "1h", "30m")
+	// Default: "24h"
+	TTL string `json:"ttl,omitempty"`
+
+	// CacheFile is where cache metadata is stored
+	// Default: "/var/lib/opnix/cache.json"
+	CacheFile string `json:"cacheFile,omitempty"`
+}
+
+// DefaultCacheTTL is the default time-to-live for cached secrets
+const DefaultCacheTTL = "24h"
+
+// DefaultCacheFile is the default location for the cache file
+const DefaultCacheFile = "/var/lib/opnix/cache.json"
+
+// GetTTL returns the configured TTL or the default if not set
+func (c *Caching) GetTTL() string {
+	if c.TTL == "" {
+		return DefaultCacheTTL
+	}
+	return c.TTL
+}
+
+// GetCacheFile returns the configured cache file path or the default if not set
+func (c *Caching) GetCacheFile() string {
+	if c.CacheFile == "" {
+		return DefaultCacheFile
+	}
+	return c.CacheFile
+}
+
 type Config struct {
 	Secrets            []Secret           `json:"secrets"`
 	PathTemplate       string             `json:"pathTemplate,omitempty"`
 	Defaults           map[string]string  `json:"defaults,omitempty"`
 	SystemdIntegration SystemdIntegration `json:"systemdIntegration,omitempty"`
+	Caching            Caching            `json:"caching,omitempty"`
 }
 
 // convertToValidationSecrets converts config secrets to validation format
@@ -128,9 +167,10 @@ func LoadMultiple(paths []string) (*Config, error) {
 		// These are handled in the merging logic below
 	}
 
-	// Use the last config's template and defaults for merged config
+	// Use the last config's template, defaults, and caching for merged config (last file wins)
 	var finalPathTemplate string
 	var finalDefaults map[string]string
+	var finalCaching Caching
 
 	for _, path := range paths {
 		config, _ := Load(path) // We know this works from above
@@ -143,12 +183,17 @@ func LoadMultiple(paths []string) (*Config, error) {
 				finalDefaults[k] = v
 			}
 		}
+		// Merge caching settings (if any config enables it, use those settings)
+		if config.Caching.Enable {
+			finalCaching = config.Caching
+		}
 	}
 
 	mergedConfig := &Config{
 		Secrets:      allSecrets,
 		PathTemplate: finalPathTemplate,
 		Defaults:     finalDefaults,
+		Caching:      finalCaching,
 	}
 
 	// Validate the merged configuration for cross-file conflicts

@@ -2,13 +2,16 @@ package secrets
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/brizzbuzz/opnix/internal/cache"
 	"github.com/brizzbuzz/opnix/internal/config"
 	"github.com/brizzbuzz/opnix/internal/errors"
 )
@@ -19,7 +22,8 @@ type SecretClient interface {
 
 type ProcessResult struct {
 	SecretPaths    map[string]string // Maps secret names to their file paths
-	ProcessedCount int
+	ProcessedCount int               // Number of secrets fetched from 1Password
+	SkippedCount   int               // Number of secrets skipped due to caching
 }
 
 type Processor struct {
@@ -27,6 +31,10 @@ type Processor struct {
 	outputDir    string
 	pathTemplate string
 	defaults     map[string]string
+
+	// Caching support
+	cache    *cache.Cache
+	cacheTTL time.Duration
 }
 
 func NewProcessor(client SecretClient, outputDir string) *Processor {
@@ -43,6 +51,23 @@ func NewProcessorWithConfig(client SecretClient, outputDir, pathTemplate string,
 		pathTemplate: pathTemplate,
 		defaults:     defaults,
 	}
+}
+
+// NewProcessorWithCache creates a processor with caching enabled.
+// The cache reduces 1Password API calls by skipping secrets that are still valid.
+func NewProcessorWithCache(client SecretClient, outputDir string, c *cache.Cache, ttl time.Duration) *Processor {
+	return &Processor{
+		client:    client,
+		outputDir: outputDir,
+		cache:     c,
+		cacheTTL:  ttl,
+	}
+}
+
+// SetCache enables caching on an existing processor.
+func (p *Processor) SetCache(c *cache.Cache, ttl time.Duration) {
+	p.cache = c
+	p.cacheTTL = ttl
 }
 
 func (p *Processor) Process(cfg *config.Config) (*ProcessResult, error) {
@@ -66,11 +91,12 @@ func (p *Processor) Process(cfg *config.Config) (*ProcessResult, error) {
 	result := &ProcessResult{
 		SecretPaths:    make(map[string]string),
 		ProcessedCount: 0,
+		SkippedCount:   0,
 	}
 
 	for i, secret := range cfg.Secrets {
 		secretName := fmt.Sprintf("secret[%d]:%s", i, secret.Path)
-		outputPath, err := p.processSecret(secret, secretName)
+		outputPath, skipped, err := p.processSecret(secret, secretName)
 		if err != nil {
 			return nil, errors.WrapWithSuggestions(
 				err,
@@ -85,38 +111,58 @@ func (p *Processor) Process(cfg *config.Config) (*ProcessResult, error) {
 		}
 
 		result.SecretPaths[secretName] = outputPath
-		result.ProcessedCount++
+		if skipped {
+			result.SkippedCount++
+		} else {
+			result.ProcessedCount++
+		}
+	}
+
+	// Save the cache if caching is enabled
+	if p.cache != nil {
+		if err := p.cache.Save(); err != nil {
+			// Log warning but don't fail - cache save is not critical
+			log.Printf("Warning: failed to save cache: %v", err)
+		}
 	}
 
 	return result, nil
 }
 
-func (p *Processor) processSecret(secret config.Secret, secretName string) (string, error) {
+// processSecret handles a single secret, returning the output path, whether it was skipped, and any error.
+// If caching is enabled and the cached secret is still valid, it returns skipped=true and no API call is made.
+func (p *Processor) processSecret(secret config.Secret, secretName string) (string, bool, error) {
+	// Determine output path first (needed for cache check)
+	outputPath, err := p.resolveSecretPathWithTemplate(secret, secretName)
+	if err != nil {
+		return "", false, err
+	}
+
+	// Check cache before making API call
+	if p.cache != nil && !p.cache.NeedsRefresh(outputPath, secret.Reference, p.cacheTTL) {
+		log.Printf("Skipping %s (cached, TTL: %v)", secretName, p.cacheTTL)
+		return outputPath, true, nil
+	}
+
 	// Resolve the secret value from 1Password
 	value, err := p.client.ResolveSecret(secret.Reference)
 	if err != nil {
-		return "", errors.OnePasswordError(
+		return "", false, errors.OnePasswordError(
 			fmt.Sprintf("Resolving secret %s", secretName),
 			fmt.Sprintf("Failed to resolve 1Password reference: %s", secret.Reference),
 			err,
 		)
 	}
 
-	// Determine output path with enhanced path management
-	outputPath, err := p.resolveSecretPathWithTemplate(secret, secretName)
-	if err != nil {
-		return "", err
-	}
-
 	// Validate the resolved path for security
 	if err := p.validateSecretPath(outputPath, secretName); err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	// Create parent directory if needed (validation already ensured it's writable)
 	parentDir := filepath.Dir(outputPath)
 	if err := os.MkdirAll(parentDir, 0755); err != nil {
-		return "", errors.FileOperationError(
+		return "", false, errors.FileOperationError(
 			fmt.Sprintf("Creating parent directory for %s", secretName),
 			parentDir,
 			"Failed to create parent directory",
@@ -131,7 +177,7 @@ func (p *Processor) processSecret(secret config.Secret, secretName string) (stri
 	}
 	fileMode, err := strconv.ParseUint(mode, 8, 32)
 	if err != nil {
-		return "", errors.ValidationError(
+		return "", false, errors.ValidationError(
 			fmt.Sprintf("Parsing file mode for %s", secretName),
 			"mode",
 			mode,
@@ -141,7 +187,7 @@ func (p *Processor) processSecret(secret config.Secret, secretName string) (stri
 
 	// Write file with specified permissions
 	if err := os.WriteFile(outputPath, []byte(value), os.FileMode(fileMode)); err != nil {
-		return "", errors.FileOperationError(
+		return "", false, errors.FileOperationError(
 			fmt.Sprintf("Writing secret file for %s", secretName),
 			outputPath,
 			"Failed to write secret to file",
@@ -152,16 +198,21 @@ func (p *Processor) processSecret(secret config.Secret, secretName string) (stri
 	// Set ownership if specified
 	if secret.Owner != "" || secret.Group != "" {
 		if err := p.setOwnership(outputPath, secret.Owner, secret.Group, secretName); err != nil {
-			return "", err
+			return "", false, err
 		}
 	}
 
 	// Create symlinks if specified
 	if err := p.createSymlinks(outputPath, secret.Symlinks, secretName); err != nil {
-		return "", err
+		return "", false, err
 	}
 
-	return outputPath, nil
+	// Update cache after successful fetch
+	if p.cache != nil {
+		p.cache.Update(outputPath, secret.Reference, value)
+	}
+
+	return outputPath, false, nil
 }
 
 // setOwnership sets the file ownership based on owner and group names

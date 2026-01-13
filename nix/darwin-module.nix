@@ -164,6 +164,53 @@ in {
       };
     };
 
+    caching = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          enable = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = ''
+              Enable smart caching to reduce 1Password API calls.
+              When enabled, secrets are only fetched from 1Password if:
+              - The secret file doesn't exist
+              - The secret reference changed in the configuration
+              - The cached secret has exceeded the TTL
+              - The secret file was modified or deleted
+
+              This is disabled by default for backwards compatibility.
+            '';
+          };
+
+          ttl = lib.mkOption {
+            type = lib.types.str;
+            default = "24h";
+            description = ''
+              How long a cached secret is considered fresh.
+              Uses Go duration format (e.g., "24h", "1h30m", "720h").
+              After this time, the secret will be re-fetched from 1Password.
+            '';
+            example = "12h";
+          };
+
+          cacheFile = lib.mkOption {
+            type = lib.types.str;
+            default = "/usr/local/var/opnix/cache.json";
+            description = "Path to the cache metadata file";
+          };
+        };
+      };
+      default = {};
+      description = ''
+        Caching configuration to reduce 1Password API calls.
+        Useful when you have API rate limits (e.g., 1000 calls/day).
+      '';
+      example = {
+        enable = true;
+        ttl = "24h";
+      };
+    };
+
     secretPaths = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = {};
@@ -219,6 +266,11 @@ in {
                 variables = secret.variables;
               })
               (validateSecretKeys cfg.secrets);
+            caching = {
+              enable = cfg.caching.enable;
+              ttl = cfg.caching.ttl;
+              cacheFile = cfg.caching.cacheFile;
+            };
           })
         else null;
 
@@ -277,6 +329,13 @@ in {
               # Ensure output directory exists with correct permissions
               mkdir -p ${cfg.outputDir}
               chmod 750 ${cfg.outputDir}
+
+              ${lib.optionalString cfg.caching.enable ''
+              # Create cache directory if caching is enabled
+              mkdir -p $(dirname ${cfg.caching.cacheFile})
+              chmod 755 $(dirname ${cfg.caching.cacheFile})
+              echo "INFO: Caching enabled (TTL: ${cfg.caching.ttl})"
+              ''}
 
               # Set up token file with correct group permissions if it exists
               if [ -f ${cfg.tokenFile} ]; then

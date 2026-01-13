@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
+	"github.com/brizzbuzz/opnix/internal/cache"
 	"github.com/brizzbuzz/opnix/internal/config"
 	"github.com/brizzbuzz/opnix/internal/errors"
 	"github.com/brizzbuzz/opnix/internal/onepass"
@@ -29,6 +31,7 @@ type secretCommand struct {
 	configFile string
 	outputDir  string
 	tokenFile  string
+	force      bool // Force refresh all secrets, bypassing cache
 
 	loadConfig       func(string) (*config.Config, error)
 	newClient        func(string) (secrets.SecretClient, error)
@@ -44,6 +47,7 @@ func newSecretCommand() *secretCommand {
 	sc.fs.StringVar(&sc.configFile, "config", "secrets.json", "Path to secrets configuration file")
 	sc.fs.StringVar(&sc.outputDir, "output", "secrets", "Directory to store retrieved secrets")
 	sc.fs.StringVar(&sc.tokenFile, "token-file", defaultTokenPath, "Path to file containing 1Password service account token")
+	sc.fs.BoolVar(&sc.force, "force", false, "Force refresh all secrets, bypassing cache")
 
 	sc.fs.Usage = func() {
 		fmt.Fprintf(sc.fs.Output(), "Usage: opnix secret [options]\n\n")
@@ -96,15 +100,48 @@ func (s *secretCommand) Run() error {
 
 	log.Printf("Initialized 1Password client successfully")
 
-	// Process secrets with detailed progress
+	// Create processor
 	processor := s.processorFactory(client, s.outputDir)
+
+	// Set up caching if enabled and not forced
+	if cfg.Caching.Enable && !s.force {
+		ttl, err := time.ParseDuration(cfg.Caching.GetTTL())
+		if err != nil {
+			return errors.ConfigError(
+				"Parsing cache TTL",
+				fmt.Sprintf("Invalid TTL format '%s' - use Go duration format (e.g., 24h, 1h30m)", cfg.Caching.TTL),
+				err,
+			)
+		}
+
+		secretCache, err := cache.Load(cfg.Caching.GetCacheFile())
+		if err != nil {
+			// Non-fatal: log warning and continue without cache
+			log.Printf("Warning: failed to load cache, continuing without caching: %v", err)
+		} else {
+			// Type assert to get the concrete processor type to call SetCache
+			if p, ok := processor.(*secrets.Processor); ok {
+				p.SetCache(secretCache, ttl)
+				log.Printf("Caching enabled (TTL: %v, cache file: %s)", ttl, cfg.Caching.GetCacheFile())
+			}
+		}
+	} else if s.force {
+		log.Printf("Force mode enabled - bypassing cache")
+	}
+
+	// Process secrets with detailed progress
 	result, err := processor.Process(cfg)
 	if err != nil {
 		// Error already has context from processor.Process
 		return err
 	}
 
-	log.Printf("Successfully processed %d secrets to %s", result.ProcessedCount, s.outputDir)
+	if result.SkippedCount > 0 {
+		log.Printf("Processed %d secrets (%d fetched, %d cached) to %s",
+			result.ProcessedCount+result.SkippedCount, result.ProcessedCount, result.SkippedCount, s.outputDir)
+	} else {
+		log.Printf("Successfully processed %d secrets to %s", result.ProcessedCount, s.outputDir)
+	}
 
 	// Process systemd integration if enabled
 	if cfg.SystemdIntegration.Enable {
