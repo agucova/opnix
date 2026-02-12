@@ -99,6 +99,16 @@ func (p *Processor) Process(cfg *config.Config) (*ProcessResult, error) {
 		SkippedCount:   0,
 	}
 
+	// Defer store save so partial state is preserved even if a later secret fails.
+	// Without this, a single bad reference causes retries to re-fetch all secrets.
+	if p.store != nil {
+		defer func() {
+			if err := p.store.Save(); err != nil {
+				log.Printf("Warning: failed to save state: %v", err)
+			}
+		}()
+	}
+
 	for i, secret := range cfg.Secrets {
 		secretName := fmt.Sprintf("secret[%d]:%s", i, secret.Path)
 		outputPath, skipped, err := p.processSecret(secret, secretName)
@@ -120,14 +130,6 @@ func (p *Processor) Process(cfg *config.Config) (*ProcessResult, error) {
 			result.SkippedCount++
 		} else {
 			result.ProcessedCount++
-		}
-	}
-
-	// Save the store if enabled
-	if p.store != nil {
-		if err := p.store.Save(); err != nil {
-			// Log warning but don't fail - store save is not critical
-			log.Printf("Warning: failed to save state: %v", err)
 		}
 	}
 

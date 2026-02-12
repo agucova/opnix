@@ -446,6 +446,12 @@ in {
             after = ["network.target"];
             wants = ["network.target"];
 
+            # Prevent unbounded restart loops from exhausting 1Password API quota.
+            # With RestartSec=30, the default StartLimitIntervalSec (10s) never
+            # accumulates burst counts, so without explicit limits retries are infinite.
+            startLimitBurst = 5;
+            startLimitIntervalSec = 300;
+
             serviceConfig = {
               Type = "oneshot";
               RemainAfterExit = true;

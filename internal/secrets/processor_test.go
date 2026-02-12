@@ -6,8 +6,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/brizzbuzz/opnix/internal/config"
+	"github.com/brizzbuzz/opnix/internal/store"
 )
 
 // Mock client for testing
@@ -317,6 +319,66 @@ func TestProcessorOwnershipValidation(t *testing.T) {
 			t.Errorf("File should exist: %v", err)
 		}
 	})
+}
+
+func TestProcessorPartialStatePersistence(t *testing.T) {
+	// When secret 2 of 2 fails, secret 1's cache state should still be saved to disk.
+	// This prevents retry loops from re-fetching all secrets on every attempt.
+	mock := &mockClient{
+		secrets: map[string]string{
+			"op://vault/item1/field": "secret-value-1",
+			// "op://vault/item2/field" is missing — will cause failure
+		},
+	}
+
+	tmpDir := t.TempDir()
+	stateFile := filepath.Join(tmpDir, "state", "state.json")
+
+	s := store.New(stateFile)
+	processor := NewProcessorWithStore(mock, tmpDir, s, 24*time.Hour)
+
+	cfg := &config.Config{
+		Secrets: []config.Secret{
+			{
+				Path:      "secret1",
+				Reference: "op://vault/item1/field",
+			},
+			{
+				Path:      "secret2",
+				Reference: "op://vault/item2/field", // Will fail
+			},
+		},
+	}
+
+	_, err := processor.Process(cfg)
+	if err == nil {
+		t.Fatal("Expected error from missing secret, got nil")
+	}
+
+	// Verify state file was written despite the error
+	loaded, loadErr := store.Load(stateFile)
+	if loadErr != nil {
+		t.Fatalf("Failed to load state file: %v", loadErr)
+	}
+
+	// Secret 1 should have its state persisted
+	secretPath := filepath.Join(tmpDir, "secret1")
+	entry, exists := loaded.GetEntry(secretPath)
+	if !exists {
+		t.Fatal("Expected state entry for secret1 to be persisted after partial failure")
+	}
+	if entry.Reference != "op://vault/item1/field" {
+		t.Errorf("Expected reference op://vault/item1/field, got %s", entry.Reference)
+	}
+	if entry.ContentHash != store.ComputeHash("secret-value-1") {
+		t.Error("Expected content hash to match secret-value-1")
+	}
+
+	// Secret 2 should NOT have an entry (it failed)
+	secret2Path := filepath.Join(tmpDir, "secret2")
+	if _, exists := loaded.GetEntry(secret2Path); exists {
+		t.Error("Expected no state entry for failed secret2")
+	}
 }
 
 // Helper function to check if string contains substring
